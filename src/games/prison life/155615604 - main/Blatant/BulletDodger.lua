@@ -2,8 +2,12 @@ local BulletDodger
 local Targets
 local Range
 local MissDistance
+local AimPrediction
+local LeadTime
 local AimDetection
 local ShotDetection
+local FirePrediction
+local Anticipation
 local DamageDetection
 local RemoteDetection
 local TracerDetection
@@ -37,12 +41,15 @@ local dodge = {
 	Cooldown = 0,
 	Flip = 0,
 	Jump = 0,
+	NextDraw = 0,
 	NextLog = 0,
+	NextPredict = 0,
 	NextScan = 0,
 	Side = 1,
 	Until = 0
 }
 local loggedRemotes, lines = {}, {}
+local aimTrack, fireTrack = {}, {}
 local hooked, healthConnection, lastHealth = false, nil, 0
 local remoteCount, remoteFired = 0, 0
 
@@ -86,7 +93,56 @@ local function printStatus()
 	print('  pl.Shoot: '..tostring(pl and pl.Shoot ~= nil)..' | pl.Bullet: '..tostring(pl and pl.Bullet ~= nil))
 	print('  GunTracers: '..tostring(pl and pl.GunTracers ~= nil)..(hooked and ' (hooked)' or ' (not hooked)'))
 	print('  gun remotes watched: '..tostring(remoteCount)..' | fired at least once: '..tostring(remoteFired))
+	local aiming, firing = 0, 0
+	for _ in aimTrack do
+		aiming = aiming + 1
+	end
+
+	for _ in fireTrack do
+		firing = firing + 1
+	end
+
+	print('  aim tracks: '..tostring(aiming)..' | fire tracks: '..tostring(firing))
 	print('  mode: '..tostring(DodgeMode.Value)..' | method: '..tostring(MoveMethod.Value)..' | range: '..tostring(Range.Value))
+end
+
+local function clampVector(vec, max)
+	if vec.Magnitude > max then
+		return vec.Unit * max
+	end
+
+	return vec
+end
+
+local function getAttribute(object, name)
+	local success, value = pcall(object.GetAttribute, object, name)
+	return success and value or nil
+end
+
+-- The point on his aim line that sits at our distance, this is what we track over time
+local function aimPointOf(origin, direction, position)
+	return origin + (direction * (position - origin).Magnitude)
+end
+
+local function recordShot(entity)
+	if not entity then
+		return
+	end
+
+	local now = os.clock()
+	local track = fireTrack[entity]
+	if not track then
+		track = {Count = 0, Interval = 0, Last = 0}
+		fireTrack[entity] = track
+	end
+
+	local interval = now - track.Last
+	if track.Last > 0 and interval > 0.02 and interval < 5 then
+		track.Interval = track.Interval > 0 and ((track.Interval * 2) + interval) / 3 or interval
+	end
+
+	track.Last = now
+	track.Count = track.Count + 1
 end
 
 local function horizontal(vec)
@@ -247,6 +303,67 @@ local function addLine(origin, direction, length, color)
 	end)
 end
 
+-- True when his gun is able to fire and is due to, either mid burst or on the next shot
+local function shotIncoming(entity, now)
+	local gun = getGun(entity)
+	if not gun then
+		return false
+	end
+
+	local reload = getAttribute(gun, 'Local_ReloadSession')
+	if type(reload) == 'number' and reload > 0 then
+		return false
+	end
+
+	local ammo = getAttribute(gun, 'Local_CurrentAmmo')
+	if type(ammo) == 'number' and ammo <= 0 then
+		return false
+	end
+
+	if getAttribute(gun, 'Local_IsShooting') == true then
+		return true
+	end
+
+	local track = fireTrack[entity]
+	if not (track and track.Last > 0) then
+		return false
+	end
+
+	local rate = getAttribute(gun, 'FireRate')
+	if type(rate) ~= 'number' or rate <= 0 then
+		rate = track.Interval > 0 and track.Interval or 0.5
+	elseif track.Interval > 0 and track.Interval < rate then
+		rate = track.Interval
+	end
+
+	if rate < 0.02 then
+		rate = 0.02
+	end
+
+	local nextshot = track.Last + rate
+	return now >= nextshot - Anticipation.Value and now <= nextshot + 0.35
+end
+
+-- His rate of fire is known from the guns own attributes or from the gap between his shots,
+-- so we can be on our way out of the line before he pulls the trigger
+local function predictShots(now)
+	local character = entitylib.character
+	local position = character.RootPart.Position
+	for entity in fireTrack do
+		if isHostile(entity) and shotIncoming(entity, now) then
+			local gun = getGun(entity)
+			local origin, direction = gun and getAimLine(entity, gun)
+			if origin and pointToLine(origin, direction, position, Range.Value) <= MissDistance.Value then
+				armThreat(direction, now + CombatTime.Value, 'Predict', entity, true)
+				if ShowLines.Enabled and dodge.NextDraw < now then
+					dodge.NextDraw = now + 0.25
+					addLine(origin, direction, math.min((position - origin).Magnitude, Range.Value), Color3.new(1, 0.6, 0.1))
+				end
+			end
+		end
+	end
+end
+
 -- Every detected shot funnels down to here, origin and point are the muzzle and where the bullet is heading
 local function bulletDetected(origin, point, source, shooter)
 	if not BulletDodger.Enabled then
@@ -256,6 +373,10 @@ local function bulletDetected(origin, point, source, shooter)
 	local root = entitylib.isAlive and entitylib.character.RootPart
 	if not root then
 		return
+	end
+
+	if shooter then
+		recordShot(shooter)
 	end
 
 	local delta = point - origin
@@ -301,6 +422,10 @@ local function impactDetected(position, source, shooter)
 	local miss = (position - root.Position).Magnitude
 	if miss > MissDistance.Value + 3 then
 		return
+	end
+
+	if shooter then
+		recordShot(shooter)
 	end
 
 	local axis = shooter and (root.Position - shooter.RootPart.Position) or (position - root.Position)
@@ -425,6 +550,9 @@ local function partAdded(object)
 		local cframe, half = object.CFrame, size.Z / 2
 		local near = cframe.Position - (cframe.LookVector * half)
 		local far = cframe.Position + (cframe.LookVector * half)
+		if (near - entitylib.character.RootPart.Position).Magnitude < 12 then
+			return
+		end
 		local shooter = nil
 		for _, entity in entitylib.List do
 			if isHostile(entity) and (entity.Head.Position - near).Magnitude < 20 then
@@ -544,25 +672,45 @@ end
 local function updateAim()
 	local character = entitylib.character
 	local position = character.RootPart.Position
-	local closest, originOf, entityOf = math.huge, nil, nil
+	local now = os.clock()
+	local closest, originOf, entityOf, trackingOf = math.huge, nil, nil, false
 	for _, entity in entitylib.List do
 		if isHostile(entity) then
 			local gun = getGun(entity)
 			if gun then
 				local origin, direction = getAimLine(entity, gun)
-				local distance = origin and (origin - position).Magnitude
-				if distance and distance <= Range.Value and distance < closest and pointToLine(origin, direction, position, Range.Value) <= MissDistance.Value then
-					if not Targets.Walls.Enabled or canSee(origin, position, entity.Character) then
-						closest, originOf, entityOf = distance, origin, entity
+				if origin and (origin - position).Magnitude <= Range.Value then
+					local point = aimPointOf(origin, direction, position)
+					local track, miss, tracking = aimTrack[entity], pointToLine(origin, direction, position, Range.Value), false
+					if track and AimPrediction.Enabled then
+						local velocity = clampVector((point - track.Point) / math.max(now - track.Time, 0.001), 200)
+						if velocity.Magnitude > 1 then
+							local lead = (point + (velocity * LeadTime.Value)) - origin
+							if lead.Magnitude > 0.1 then
+								local predicted = pointToLine(origin, lead.Unit, position, Range.Value)
+								if predicted < miss then
+									miss, tracking = predicted, true
+								end
+							end
+						end
 					end
+
+					aimTrack[entity] = {Point = point, Time = now}
+					if miss <= MissDistance.Value and miss < closest then
+						if not Targets.Walls.Enabled or canSee(origin, position, entity.Character) then
+							closest, originOf, entityOf, trackingOf = miss, origin, entity, tracking
+						end
+					end
+				else
+					aimTrack[entity] = nil
 				end
 			end
 		end
 	end
 
 	if originOf then
-		armThreat(position - originOf, os.clock() + 0.15, 'Aim', entityOf)
-		logBullet('Aimed at by '..(entityOf.Player and entityOf.Player.Name or 'an NPC'))
+		armThreat(position - originOf, os.clock() + 0.15, trackingOf and 'Aim Predict' or 'Aim', entityOf)
+		logBullet('Aimed at by '..(entityOf.Player and entityOf.Player.Name or 'an NPC')..(trackingOf and ', his aim is tracking us' or ''))
 	end
 end
 
@@ -580,6 +728,11 @@ local function update(delta)
 	if AimDetection.Enabled and dodge.NextScan < now then
 		dodge.NextScan = now + 0.05
 		updateAim()
+	end
+
+	if FirePrediction.Enabled and dodge.NextPredict < now then
+		dodge.NextPredict = now + 0.05
+		predictShots(now)
 	end
 
 	if not dodge.Active then
@@ -620,6 +773,8 @@ local function update(delta)
 end
 
 local function refreshOptions()
+	LeadTime.Object.Visible = AimPrediction.Enabled
+	Anticipation.Object.Visible = FirePrediction.Enabled
 	local mode = DodgeMode.Value
 	JumpChance.Object.Visible = mode ~= 'Strafe'
 	JumpDelay.Object.Visible = mode ~= 'Strafe'
@@ -635,6 +790,11 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 			if entitylib.isAlive then
 				task.spawn(bindHealth, entitylib.character)
 			end
+
+			BulletDodger:Clean(entitylib.Events.EntityRemoved:Connect(function(entity)
+				aimTrack[entity] = nil
+				fireTrack[entity] = nil
+			end))
 
 			BulletDodger:Clean(function()
 				if healthConnection then
@@ -661,13 +821,15 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 			end
 
 			table.clear(lines)
+			table.clear(aimTrack)
+			table.clear(fireTrack)
 			console('disabled')
 		end
 	end,
 	ExtraText = function()
 		return dodge.Active and 'Dodging' or nil
 	end,
-	Tooltip = 'Moves you out of the line of fire.\nAim - Strafes while someone with a gun is aiming at you, this is the only source that works on the instant hit guns\nShots - Strafes when a bullet or tracer is detected\nDamage - Strafes for a moment after you take a hit'
+	Tooltip = 'Moves you out of the line of fire.\nPredict - Reads where his aim is heading and when his next shot is due, then steps out right before he fires\nAim - Strafes while someone with a gun is aiming at you\nShots - Strafes when a bullet or tracer is detected\nDamage - Strafes for a moment after you take a hit'
 })
 Targets = BulletDodger:CreateTargets({
 	Players = true,
@@ -693,6 +855,26 @@ MissDistance = BulletDodger:CreateSlider({
 	end,
 	Tooltip = 'How close a bullet or an aim line has to pass before it counts as aimed at you.'
 })
+AimPrediction = BulletDodger:CreateToggle({
+	Name = 'Aim Prediction',
+	Default = true,
+	Function = function(callback)
+		LeadTime.Object.Visible = callback
+	end,
+	Tooltip = 'Read where his aim is heading, not where it is now.\nHis crosshair is following a delayed copy of you, so leading his own lead is what catches the shot before he fires it.'
+})
+LeadTime = BulletDodger:CreateSlider({
+	Name = 'Lead Time',
+	Min = 0,
+	Max = 0.5,
+	Default = 0.15,
+	Decimal = 100,
+	Darker = true,
+	Suffix = function(val)
+		return val == 1 and 'second' or 'seconds'
+	end,
+	Tooltip = 'How far ahead of his aim we look, raise it if he still lands shots.'
+})
 AimDetection = BulletDodger:CreateToggle({
 	Name = 'Aim Detection',
 	Default = true,
@@ -707,6 +889,26 @@ DamageDetection = BulletDodger:CreateToggle({
 	Name = 'Damage Detection',
 	Default = true,
 	Tooltip = 'Dodge for a few seconds after taking a hit, in case the other sources miss something.'
+})
+FirePrediction = BulletDodger:CreateToggle({
+	Name = 'Fire Prediction',
+	Default = true,
+	Function = function(callback)
+		Anticipation.Object.Visible = callback
+	end,
+	Tooltip = 'Learn his rate of fire and be out of the line right before the next shot.\nUses his guns own Local_IsShooting, Local_CurrentAmmo and FireRate attributes when they replicate, otherwise the measured gap between his shots.'
+})
+Anticipation = BulletDodger:CreateSlider({
+	Name = 'Anticipation',
+	Min = 0.02,
+	Max = 0.5,
+	Default = 0.12,
+	Decimal = 100,
+	Darker = true,
+	Suffix = function(val)
+		return val == 1 and 'second' or 'seconds'
+	end,
+	Tooltip = 'How early before his next predicted shot we start moving.'
 })
 RemoteDetection = BulletDodger:CreateToggle({
 	Name = 'Gun Remotes',
