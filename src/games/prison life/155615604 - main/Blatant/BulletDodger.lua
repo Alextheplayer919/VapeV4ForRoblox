@@ -44,6 +44,7 @@ local dodge = {
 }
 local loggedRemotes, lines = {}, {}
 local hooked, healthConnection, lastHealth = false, nil, 0
+local remoteCount, remoteFired = 0, 0
 
 local rayCheck = RaycastParams.new()
 rayCheck.RespectCanCollide = true
@@ -60,12 +61,32 @@ local function notifBullet(text)
 	end
 end
 
+local function console(...)
+	if DebugLog.Enabled then
+		print('[BulletDodger]', ...)
+	end
+end
+
 local function logBullet(text)
 	local now = os.clock()
 	if DebugLog.Enabled and dodge.NextLog < now then
 		dodge.NextLog = now + 0.5
+		print('[BulletDodger]', text)
+	end
+
+	if Notify.Enabled then
 		notif('BulletDodger', text, 3)
 	end
+end
+
+local function printStatus()
+	print('[BulletDodger] status')
+	print('  place: '..tostring(game.PlaceId))
+	print('  alive: '..tostring(entitylib.isAlive))
+	print('  pl.Shoot: '..tostring(pl and pl.Shoot ~= nil)..' | pl.Bullet: '..tostring(pl and pl.Bullet ~= nil))
+	print('  GunTracers: '..tostring(pl and pl.GunTracers ~= nil)..(hooked and ' (hooked)' or ' (not hooked)'))
+	print('  gun remotes watched: '..tostring(remoteCount)..' | fired at least once: '..tostring(remoteFired))
+	print('  mode: '..tostring(DodgeMode.Value)..' | method: '..tostring(MoveMethod.Value)..' | range: '..tostring(Range.Value))
 end
 
 local function horizontal(vec)
@@ -310,6 +331,7 @@ local function installGunHooks()
 
 	local gunTracers = pl and pl.GunTracers
 	if not gunTracers then
+		console('no pl.GunTracers found, cannot hook the guns')
 		return
 	end
 
@@ -324,6 +346,7 @@ local function installGunHooks()
 
 			previous = hookfunction(original, replacement)
 			hooked = true
+			console('hooked GunTracers.'..name)
 		end
 	end
 end
@@ -333,6 +356,8 @@ local function watchRemote(remote)
 		return
 	end
 
+	remoteCount = remoteCount + 1
+	console('watching remote '..remote.Name)
 	remote.OnClientEvent:Connect(function(...)
 		if not (BulletDodger.Enabled and RemoteDetection.Enabled) then
 			return
@@ -351,6 +376,7 @@ local function watchRemote(remote)
 
 		if not loggedRemotes[remote] then
 			loggedRemotes[remote] = true
+			remoteFired = remoteFired + 1
 			local types = {}
 			for index = 1, args.n do
 				table.insert(types, typeof(args[index]))
@@ -624,6 +650,7 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 			end
 
 			refreshOptions()
+			task.defer(printStatus)
 			BulletDodger:Clean(runService.Heartbeat:Connect(update))
 		else
 			threat.Time = 0
@@ -634,6 +661,7 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 			end
 
 			table.clear(lines)
+			console('disabled')
 		end
 	end,
 	ExtraText = function()
@@ -832,5 +860,10 @@ DebugLog = BulletDodger:CreateToggle({
 	Name = 'Debug',
 	Default = false,
 	Darker = true,
-	Tooltip = 'Log every detection with its source, use this to see what actually fires in game.'
+	Function = function(callback)
+		if callback then
+			task.defer(printStatus)
+		end
+	end,
+	Tooltip = 'Print every detection with its source to the developer console (F9).\nTurning it on dumps a status block straight away.'
 })
