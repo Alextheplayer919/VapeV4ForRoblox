@@ -2,6 +2,9 @@ local BulletDodger
 local Targets
 local Range
 local MissDistance
+local AimSource
+local AimBias
+local JukeRange
 local AimPrediction
 local LeadTime
 local AimDetection
@@ -49,7 +52,7 @@ local dodge = {
 	Until = 0
 }
 local loggedRemotes, lines = {}, {}
-local aimTrack, fireTrack = {}, {}
+local aimTrack, biasTrack, fireTrack = {}, {}, {}
 local hooked, healthConnection, lastHealth = false, nil, 0
 local remoteCount, remoteFired = 0, 0
 
@@ -103,7 +106,14 @@ local function printStatus()
 	end
 
 	print('  aim tracks: '..tostring(aiming)..' | fire tracks: '..tostring(firing))
-	print('  mode: '..tostring(DodgeMode.Value)..' | method: '..tostring(MoveMethod.Value)..' | range: '..tostring(Range.Value))
+	print('  mode: '..tostring(DodgeMode.Value)..' | method: '..tostring(MoveMethod.Value)..' | aim source: '..tostring(AimSource.Value)..' | range: '..tostring(Range.Value))
+	local listed = 0
+	for entity, bias in biasTrack do
+		if listed < 3 and bias.Samples >= 2 and entity.Player then
+			listed = listed + 1
+			print('  aim bias for '..entity.Player.Name..': yaw '..math.floor(math.deg(bias.Yaw))..' deg, pitch '..math.floor(math.deg(bias.Pitch))..' deg over '..tostring(bias.Samples)..' shots')
+		end
+	end
 end
 
 local function clampVector(vec, max)
@@ -122,27 +132,6 @@ end
 -- The point on his aim line that sits at our distance, this is what we track over time
 local function aimPointOf(origin, direction, position)
 	return origin + (direction * (position - origin).Magnitude)
-end
-
-local function recordShot(entity)
-	if not entity then
-		return
-	end
-
-	local now = os.clock()
-	local track = fireTrack[entity]
-	if not track then
-		track = {Count = 0, Interval = 0, Last = 0}
-		fireTrack[entity] = track
-	end
-
-	local interval = now - track.Last
-	if track.Last > 0 and interval > 0.02 and interval < 5 then
-		track.Interval = track.Interval > 0 and ((track.Interval * 2) + interval) / 3 or interval
-	end
-
-	track.Last = now
-	track.Count = track.Count + 1
 end
 
 local function horizontal(vec)
@@ -239,6 +228,69 @@ local function getAimLine(entity, gun)
 	end
 
 	return origin, head.CFrame.LookVector
+end
+
+local function getBias(entity)
+	local bias = biasTrack[entity]
+	if bias and bias.Samples >= 2 and (os.clock() - bias.Time) < 8 then
+		return bias
+	end
+
+	return nil
+end
+
+-- Rotate a direction by the learned yaw and pitch gap between his body and his crosshair
+local function rotateDirection(direction, yaw, pitch)
+	local flat = horizontal(direction)
+	if not flat then
+		return direction
+	end
+
+	local turned = CFrame.Angles(0, yaw, 0):VectorToWorldSpace(flat)
+	local angle = math.clamp(math.asin(math.clamp(direction.Y, -1, 1)) + pitch, -1.45, 1.45)
+	return (turned * math.cos(angle)) + Vector3.new(0, math.sin(angle), 0)
+end
+
+-- Where he is actually pointing, which is not his head when he is not shiftlocked
+local function getAimDirection(entity, gun)
+	local origin, facing = getAimLine(entity, gun)
+	if not origin then
+		return nil
+	end
+
+	if AimBias.Enabled and AimSource.Value ~= 'Shiftlock' then
+		local bias = getBias(entity)
+		if bias then
+			facing = rotateDirection(facing, bias.Yaw, bias.Pitch)
+		end
+	end
+
+	return origin, facing
+end
+
+-- Without shiftlock the character faces wherever he is walking, so compare the two
+local function freeAiming(entity)
+	local move = entity.Humanoid and entity.Humanoid.MoveDirection
+	local facing = horizontal(entity.Head.CFrame.LookVector)
+	local walking = move and horizontal(move)
+	if not (facing and walking) then
+		return nil
+	end
+
+	return facing:Dot(walking) > 0.9
+end
+
+local function allowsJuke(entity)
+	if AimSource.Value == 'Shiftlock' or JukeRange.Value <= 0 then
+		return false
+	end
+
+	if AimSource.Value == 'Free aim' then
+		return true
+	end
+
+	local bias = getBias(entity)
+	return (bias and math.abs(bias.Yaw) > 0.15) or freeAiming(entity) == true
 end
 
 local function getClosestThreat()
@@ -351,8 +403,7 @@ local function predictShots(now)
 	local position = character.RootPart.Position
 	for entity in fireTrack do
 		if isHostile(entity) and shotIncoming(entity, now) then
-			local gun = getGun(entity)
-			local origin, direction = gun and getAimLine(entity, gun)
+			local origin, direction = getAimDirection(entity, getGun(entity))
 			if origin and pointToLine(origin, direction, position, Range.Value) <= MissDistance.Value then
 				armThreat(direction, now + CombatTime.Value, 'Predict', entity, true)
 				if ShowLines.Enabled and dodge.NextDraw < now then
@@ -364,6 +415,57 @@ local function predictShots(now)
 	end
 end
 
+-- Two things are learned from every shot he takes: how fast he fires, and how far his body
+-- is from where he is actually pointing. The second one is what makes free aim readable,
+-- without shiftlock his head faces where he walks instead of where he looks.
+local function recordShot(entity, direction)
+	if not entity then
+		return
+	end
+
+	local now = os.clock()
+	local track = fireTrack[entity]
+	if not track then
+		track = {Count = 0, Interval = 0, Last = 0}
+		fireTrack[entity] = track
+	end
+
+	local interval = now - track.Last
+	if track.Last > 0 and interval > 0.02 and interval < 5 then
+		track.Interval = track.Interval > 0 and ((track.Interval * 2) + interval) / 3 or interval
+	end
+
+	track.Last = now
+	track.Count = track.Count + 1
+
+	if not (AimBias.Enabled and direction and entity.Head and entity.Head.Parent) then
+		return
+	end
+
+	local flat, facing = horizontal(direction), horizontal(entity.Head.CFrame.LookVector)
+	if not (flat and facing) then
+		return
+	end
+
+	local bias = biasTrack[entity]
+	if not bias or (now - bias.Time) > 8 then
+		bias = {Pitch = 0, Samples = 0, Time = now, Yaw = 0}
+		biasTrack[entity] = bias
+	end
+
+	local yaw = math.atan2(facing:Cross(flat).Y, facing:Dot(flat))
+	local pitch = math.asin(math.clamp(direction.Y, -1, 1)) - math.asin(math.clamp(entity.Head.CFrame.LookVector.Y, -1, 1))
+	if bias.Samples > 0 then
+		bias.Yaw = (bias.Yaw * 0.7) + (yaw * 0.3)
+		bias.Pitch = (bias.Pitch * 0.7) + (pitch * 0.3)
+	else
+		bias.Yaw, bias.Pitch = yaw, pitch
+	end
+
+	bias.Samples = bias.Samples + 1
+	bias.Time = now
+end
+
 -- Every detected shot funnels down to here, origin and point are the muzzle and where the bullet is heading
 local function bulletDetected(origin, point, source, shooter)
 	if not BulletDodger.Enabled then
@@ -373,10 +475,6 @@ local function bulletDetected(origin, point, source, shooter)
 	local root = entitylib.isAlive and entitylib.character.RootPart
 	if not root then
 		return
-	end
-
-	if shooter then
-		recordShot(shooter)
 	end
 
 	local delta = point - origin
@@ -397,6 +495,10 @@ local function bulletDetected(origin, point, source, shooter)
 	end
 
 	local miss = pointToLine(origin, direction, position, length)
+	if shooter then
+		recordShot(shooter, miss <= MissDistance.Value + 10 and direction or nil)
+	end
+
 	if miss <= MissDistance.Value then
 		armThreat(shooter and (position - shooter.RootPart.Position) or direction, os.clock() + CombatTime.Value, source, shooter, true)
 		addLine(origin, direction, length, Color3.new(1, 0.25, 0.25))
@@ -673,12 +775,12 @@ local function updateAim()
 	local character = entitylib.character
 	local position = character.RootPart.Position
 	local now = os.clock()
-	local closest, originOf, entityOf, trackingOf = math.huge, nil, nil, false
+	local closest, originOf, entityOf, sourceOf = math.huge, nil, nil, 'Aim'
 	for _, entity in entitylib.List do
 		if isHostile(entity) then
 			local gun = getGun(entity)
 			if gun then
-				local origin, direction = getAimLine(entity, gun)
+				local origin, direction = getAimDirection(entity, gun)
 				if origin and (origin - position).Magnitude <= Range.Value then
 					local point = aimPointOf(origin, direction, position)
 					local track, miss, tracking = aimTrack[entity], pointToLine(origin, direction, position, Range.Value), false
@@ -698,19 +800,30 @@ local function updateAim()
 					aimTrack[entity] = {Point = point, Time = now}
 					if miss <= MissDistance.Value and miss < closest then
 						if not Targets.Walls.Enabled or canSee(origin, position, entity.Character) then
-							closest, originOf, entityOf, trackingOf = miss, origin, entity, tracking
+							closest, originOf, entityOf = miss, origin, entity
+							sourceOf = tracking and 'Aim Predict' or 'Aim'
 						end
 					end
 				else
 					aimTrack[entity] = nil
+				end
+
+				-- He walks the way he faces, so his body says nothing about his crosshair, stay moving instead
+				if allowsJuke(entity) then
+					local head, distance = entity.Head.Position, (entity.Head.Position - position).Magnitude
+					if distance <= JukeRange.Value and distance < closest then
+						if not Targets.Walls.Enabled or canSee(head, position, entity.Character) then
+							closest, originOf, entityOf, sourceOf = distance, head, entity, 'Free Aim'
+						end
+					end
 				end
 			end
 		end
 	end
 
 	if originOf then
-		armThreat(position - originOf, os.clock() + 0.15, trackingOf and 'Aim Predict' or 'Aim', entityOf)
-		logBullet('Aimed at by '..(entityOf.Player and entityOf.Player.Name or 'an NPC')..(trackingOf and ', his aim is tracking us' or ''))
+		armThreat(position - originOf, os.clock() + 0.15, sourceOf, entityOf)
+		logBullet('Aimed at by '..(entityOf.Player and entityOf.Player.Name or 'an NPC')..(sourceOf == 'Free Aim' and ', he is free aiming' or '')..(sourceOf == 'Aim Predict' and ', his aim is tracking us' or ''))
 	end
 end
 
@@ -793,6 +906,7 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 
 			BulletDodger:Clean(entitylib.Events.EntityRemoved:Connect(function(entity)
 				aimTrack[entity] = nil
+				biasTrack[entity] = nil
 				fireTrack[entity] = nil
 			end))
 
@@ -822,6 +936,7 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 
 			table.clear(lines)
 			table.clear(aimTrack)
+			table.clear(biasTrack)
 			table.clear(fireTrack)
 			console('disabled')
 		end
@@ -829,7 +944,7 @@ BulletDodger = vape.Categories.Blatant:CreateModule({
 	ExtraText = function()
 		return dodge.Active and 'Dodging' or nil
 	end,
-	Tooltip = 'Moves you out of the line of fire.\nPredict - Reads where his aim is heading and when his next shot is due, then steps out right before he fires\nAim - Strafes while someone with a gun is aiming at you\nShots - Strafes when a bullet or tracer is detected\nDamage - Strafes for a moment after you take a hit'
+	Tooltip = 'Moves you out of the line of fire.\nPredict - Reads where his aim is heading and when his next shot is due, then steps out right before he fires\nFree aim - Keeps you moving against shooters whose body does not tell us where they look\nAim - Strafes while someone with a gun is aiming at you\nShots - Strafes when a bullet or tracer is detected\nDamage - Strafes for a moment after you take a hit'
 })
 Targets = BulletDodger:CreateTargets({
 	Players = true,
@@ -854,6 +969,28 @@ MissDistance = BulletDodger:CreateSlider({
 		return val == 1 and 'stud' or 'studs'
 	end,
 	Tooltip = 'How close a bullet or an aim line has to pass before it counts as aimed at you.'
+})
+AimSource = BulletDodger:CreateDropdown({
+	Name = 'Aim Source',
+	List = {'Auto', 'Shiftlock', 'Free aim'},
+	Tooltip = 'Where his aim really comes from.\nAuto - works it out per shooter from how they move and from the shots they take\nShiftlock - his head always points where he aims, trust it\nFree aim - he faces where he walks, so watch his shots and juke at close range instead'
+})
+AimBias = BulletDodger:CreateToggle({
+	Name = 'Aim Bias',
+	Default = true,
+	Darker = true,
+	Tooltip = 'Learn the gap between his body and his crosshair from his own shots, so his aim can still be read without shiftlock.'
+})
+JukeRange = BulletDodger:CreateSlider({
+	Name = 'Juke Range',
+	Min = 0,
+	Max = 100,
+	Default = 40,
+	Darker = true,
+	Suffix = function(val)
+		return val == 1 and 'stud' or 'studs'
+	end,
+	Tooltip = 'Without shiftlock his aim is hidden, so stay moving whenever he is this close with a gun and a clean line to us. 0 turns this off.'
 })
 AimPrediction = BulletDodger:CreateToggle({
 	Name = 'Aim Prediction',
